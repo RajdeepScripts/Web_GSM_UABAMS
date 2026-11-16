@@ -158,8 +158,15 @@ function _notifRender() {
 
 
 // ── Email notification settings ──────────────────────────────────────────
-let emailConfig = { emails: [], minSeverity: 'MEDIUM', enabled: true };
+let emailConfig = { emails: [], phones: [], minSeverity: 'MEDIUM', enabled: true };
 let emailHistory = JSON.parse(localStorage.getItem('notifEmailHistory') || '[]');
+let phoneHistory = JSON.parse(localStorage.getItem('notifPhoneHistory') || '[]');
+
+// Escape untrusted text before interpolating into innerHTML — emails/phones
+// round-trip through the config API and are rendered as raw HTML below.
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
 
 function updateEmailHistory(emails) {
     const all = [...emailHistory, ...emails];
@@ -167,7 +174,7 @@ function updateEmailHistory(emails) {
     localStorage.setItem('notifEmailHistory', JSON.stringify(emailHistory));
 
     const datalist = document.getElementById('emailHistory');
-    if (datalist) datalist.innerHTML = emailHistory.map(e => `<option value="${e}">`).join('');
+    if (datalist) datalist.innerHTML = emailHistory.map(e => `<option value="${escapeHtml(e)}">`).join('');
 
     renderEmailHistoryList(); // keep checklist in sync whenever history changes
 }
@@ -177,8 +184,8 @@ function renderEmailList(emails) {
     if (!container) return;
     container.innerHTML = emails.map(email =>
         `<span class="notif-email-tag">
-            ${email}
-            <span class="remove" data-email="${email}">&times;</span>
+            ${escapeHtml(email)}
+            <span class="remove" data-email="${escapeHtml(email)}">&times;</span>
         </span>`
     ).join('');
 
@@ -209,10 +216,10 @@ function renderEmailHistoryList() {
     container.innerHTML = emailHistory.map(email => `
         <div class="notif-email-history-item">
             <label>
-                <input type="checkbox" data-email="${email}" ${active.has(email) ? 'checked' : ''}>
-                <span>${email}</span>
+                <input type="checkbox" data-email="${escapeHtml(email)}" ${active.has(email) ? 'checked' : ''}>
+                <span>${escapeHtml(email)}</span>
             </label>
-            <button type="button" class="notif-email-history-delete" data-email="${email}" title="Remove permanently">
+            <button type="button" class="notif-email-history-delete" data-email="${escapeHtml(email)}" title="Remove permanently">
                 <i class="fas fa-trash-alt"></i>
             </button>
         </div>
@@ -239,12 +246,150 @@ function renderEmailHistoryList() {
             emailHistory = emailHistory.filter(e => e !== email);
             localStorage.setItem('notifEmailHistory', JSON.stringify(emailHistory));
             const datalist = document.getElementById('emailHistory');
-            if (datalist) datalist.innerHTML = emailHistory.map(e => `<option value="${e}">`).join('');
+            if (datalist) datalist.innerHTML = emailHistory.map(e => `<option value="${escapeHtml(e)}">`).join('');
             emailConfig.emails = (emailConfig.emails || []).filter(e => e !== email);
             renderEmailList(emailConfig.emails);
             renderEmailHistoryList();
             saveEmailConfig();
         });
+    });
+}
+
+// ── SMS notification settings (phones[], same config as email) ───────────
+// Mirrors the email list/history/add functions above — same tag UI, same
+// datalist-of-previously-used-values pattern — just targeting the
+// notifPhone* elements and emailConfig.phones instead of .emails.
+function updatePhoneHistory(phones) {
+    const all = [...phoneHistory, ...phones];
+    phoneHistory = [...new Set(all)].slice(0, 50);
+    localStorage.setItem('notifPhoneHistory', JSON.stringify(phoneHistory));
+
+    const datalist = document.getElementById('phoneHistory');
+    if (datalist) datalist.innerHTML = phoneHistory.map(p => `<option value="${escapeHtml(p)}">`).join('');
+
+    renderPhoneHistoryList();
+}
+
+function renderPhoneList(phones) {
+    const container = document.getElementById('notifPhoneList');
+    if (!container) return;
+    container.innerHTML = phones.map(phone =>
+        `<span class="notif-email-tag">
+            ${escapeHtml(phone)}
+            <span class="remove" data-phone="${escapeHtml(phone)}">&times;</span>
+        </span>`
+    ).join('');
+
+    container.querySelectorAll('.remove').forEach(el => {
+        el.addEventListener('click', () => {
+            const phone = el.dataset.phone;
+            emailConfig.phones = (emailConfig.phones || []).filter(p => p !== phone);
+            renderPhoneList(emailConfig.phones);
+            renderPhoneHistoryList();
+            saveEmailConfig();
+        });
+    });
+
+    renderPhoneHistoryList();
+}
+
+function renderPhoneHistoryList() {
+    const container = document.getElementById('notifPhoneHistoryList');
+    if (!container) return;
+
+    if (!phoneHistory.length) {
+        container.innerHTML = '<p style="font-size:0.72rem;color:#94a3b8;margin-top:0.4rem;">No previous numbers yet</p>';
+        return;
+    }
+
+    const active = new Set(emailConfig.phones || []);
+
+    container.innerHTML = phoneHistory.map(phone => `
+        <div class="notif-email-history-item">
+            <label>
+                <input type="checkbox" data-phone="${escapeHtml(phone)}" ${active.has(phone) ? 'checked' : ''}>
+                <span>${escapeHtml(phone)}</span>
+            </label>
+            <button type="button" class="notif-email-history-delete" data-phone="${escapeHtml(phone)}" title="Remove permanently">
+                <i class="fas fa-trash-alt"></i>
+            </button>
+        </div>
+    `).join('');
+
+    container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener('change', () => {
+            const phone = cb.dataset.phone;
+            const current = emailConfig.phones || [];
+            if (cb.checked) {
+                if (!current.includes(phone)) current.push(phone);
+            } else {
+                emailConfig.phones = current.filter(p => p !== phone);
+            }
+            renderPhoneList(emailConfig.phones);
+            saveEmailConfig();
+        });
+    });
+
+    container.querySelectorAll('.notif-email-history-delete').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const phone = btn.dataset.phone;
+            if (!confirm(`Remove "${phone}" from saved history? This can't be undone.`)) return;
+            phoneHistory = phoneHistory.filter(p => p !== phone);
+            localStorage.setItem('notifPhoneHistory', JSON.stringify(phoneHistory));
+            const datalist = document.getElementById('phoneHistory');
+            if (datalist) datalist.innerHTML = phoneHistory.map(p => `<option value="${escapeHtml(p)}">`).join('');
+            emailConfig.phones = (emailConfig.phones || []).filter(p => p !== phone);
+            renderPhoneList(emailConfig.phones);
+            renderPhoneHistoryList();
+            saveEmailConfig();
+        });
+    });
+}
+
+// Loose E.164-ish check: optional leading +, 7-15 digits otherwise —
+// permissive on purpose since the GSM module, not this UI, is the thing
+// that actually validates/dials the number.
+function isValidPhone(value) {
+    return /^\+?[0-9]{7,15}$/.test(value.replace(/[\s-]/g, ''));
+}
+
+function initPhoneAddButton() {
+    const addBtn = document.getElementById('notifPhoneAddBtn');
+    const input = document.getElementById('notifPhoneInput');
+    if (!addBtn || !input) return;
+
+    const addPhone = () => {
+        const raw = input.value.trim();
+        if (!raw) return;
+        const phone = raw.replace(/[\s-]/g, '');
+        if (!isValidPhone(phone)) {
+            alert('Please enter a valid phone number (digits only, optional leading +).');
+            return;
+        }
+        const current = emailConfig.phones || [];
+        if (current.includes(phone)) {
+            alert('Phone number already added.');
+            input.value = '';
+            input.blur();
+            input.focus();
+            return;
+        }
+        current.push(phone);
+        emailConfig.phones = current;
+
+        renderPhoneList(current);
+        updatePhoneHistory(current);
+
+        input.value = '';
+        input.blur();
+        input.focus();
+
+        saveEmailConfig();
+    };
+
+    addBtn.addEventListener('click', addPhone);
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); addPhone(); }
     });
 }
 
@@ -255,11 +400,13 @@ async function loadEmailConfig() {
             const data = await res.json();
             emailConfig = data;
             const severitySelect = document.getElementById('notifMinSeverity');
-            
+
             if (severitySelect) severitySelect.value = data.minSeverity || 'MEDIUM';
            ;
             renderEmailList(data.emails || []);
             updateEmailHistory(data.emails || []);
+            renderPhoneList(data.phones || []);
+            updatePhoneHistory(data.phones || []);
             loadInitialNotifAlerts(); // refresh the alert list based on the new threshold
         } else {
             console.warn('[notify] Failed to load email config');
@@ -271,18 +418,24 @@ async function loadEmailConfig() {
 
 async function saveEmailConfig() {
     const severitySelect = document.getElementById('notifMinSeverity');
-   
+
     const statusEl = document.getElementById('notifSettingsStatus');
 
     const minSeverity = severitySelect.value;
-   
+
     try {
         const res = await fetch('/api/notify-emails', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 emails: emailConfig.emails,
+                phones: emailConfig.phones,
                 minSeverity,
+                // Previously omitted — every save silently reset cooldownSec
+                // back to the server's default (60) even when a different
+                // value was already configured. Round-trip whatever's
+                // currently known instead of dropping it.
+                cooldownSec: emailConfig.cooldownSec,
                 enabled: true
             })
         });
@@ -290,6 +443,7 @@ async function saveEmailConfig() {
             const data = await res.json();
             emailConfig = data.notifyConfig;
             renderEmailList(emailConfig.emails || []);   // re-sync after server round-trip
+            renderPhoneList(emailConfig.phones || []);
             if (statusEl) {
                 statusEl.textContent = '✅ Settings saved!';
                 statusEl.style.color = '#22c55e';
@@ -413,6 +567,7 @@ function initEmailSaveButton() {
     initNotifTabs();
     initEmailSaveButton();
     initEmailAddButton();
+    initPhoneAddButton();
 })();
 
 function _severityRank(s) {
