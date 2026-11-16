@@ -423,6 +423,7 @@ const pool = new Pool({
 });
 
 const nodemailer = require('nodemailer');
+const smsGateway = require('./smsGateway');
 const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: process.env.SMTP_PORT || 587,
@@ -433,13 +434,14 @@ const transporter = nodemailer.createTransport({
 async function loadNotifyEmails() {
     try {
         const result = await pool.query(
-            `SELECT emails, min_severity, cooldown_sec, enabled 
+            `SELECT emails, phones, min_severity, cooldown_sec, enabled
              FROM notification_config LIMIT 1`
         );
         if (result.rows.length) {
             const row = result.rows[0];
             return {
                 emails: row.emails || [],
+                phones: row.phones || [],
                 minSeverity: row.min_severity || 'MEDIUM',
                 cooldownSec: row.cooldown_sec || 60,
                 enabled: row.enabled !== undefined ? row.enabled : true,
@@ -452,23 +454,25 @@ async function loadNotifyEmails() {
     try {
         if (fs.existsSync(NOTIFY_FILE)) {
             const data = JSON.parse(fs.readFileSync(NOTIFY_FILE, 'utf8'));
+            if (!data.phones) data.phones = [];
             return data;
         }
     } catch (e) { /* ignore */ }
-    return { emails: [], minSeverity: 'MEDIUM', cooldownSec: 60, enabled: true };
+    return { emails: [], phones: [], minSeverity: 'MEDIUM', cooldownSec: 60, enabled: true };
 }
 
 async function saveNotifyEmails(cfg) {
     try {
         await pool.query(
-            `UPDATE notification_config 
-             SET emails = $1, 
-                 min_severity = $2, 
-                 cooldown_sec = $3, 
-                 enabled = $4,
+            `UPDATE notification_config
+             SET emails = $1,
+                 phones = $2,
+                 min_severity = $3,
+                 cooldown_sec = $4,
+                 enabled = $5,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = (SELECT id FROM notification_config LIMIT 1)`,
-            [cfg.emails || [], cfg.minSeverity || 'MEDIUM', cfg.cooldownSec ?? 60, cfg.enabled !== undefined ? cfg.enabled : true]
+            [cfg.emails || [], cfg.phones || [], cfg.minSeverity || 'MEDIUM', cfg.cooldownSec ?? 60, cfg.enabled !== undefined ? cfg.enabled : true]
         );
         console.log('[notify] Config saved to DB');
     } catch (e) {
@@ -478,7 +482,7 @@ async function saveNotifyEmails(cfg) {
     }
 }
 
-let notifyConfig = { emails: [], minSeverity: 'MEDIUM', cooldownSec: 60, enabled: true };
+let notifyConfig = { emails: [], phones: [], minSeverity: 'MEDIUM', cooldownSec: 60, enabled: true };
 
 (async function initNotifyConfig() {
     notifyConfig = await loadNotifyEmails();
@@ -493,10 +497,15 @@ function severityRank(s) {
 }
 
 async function maybeSendImpactEmail(impact) {
-     if (!notifyConfig.enabled) return;
-    if (!notifyConfig.emails.length) return;
+    if (!notifyConfig.enabled) return;
+    const hasEmails = notifyConfig.emails && notifyConfig.emails.length;
+    const hasPhones = notifyConfig.phones && notifyConfig.phones.length;
+    if (!hasEmails && !hasPhones) return;
     if (severityRank(impact.severity) < severityRank(notifyConfig.minSeverity)) return;
 
+    // Shared cooldown gate across both channels — one impact on a given
+    // sensor triggers at most one round of alerts (email + SMS together)
+    // per cooldownSec, same as before SMS was added.
     const now = Date.now();
     const last = lastEmailAt[impact.sensor] || 0;
     if (now - last < notifyConfig.cooldownSec * 1000) return;
@@ -505,30 +514,39 @@ async function maybeSendImpactEmail(impact) {
     const mapsLink = (lastGpsCoord?.lat && lastGpsCoord?.lng)
         ? `https://maps.google.com/?q=${lastGpsCoord.lat},${lastGpsCoord.lng}` : 'No GPS fix';
 
-    const html = `
-        <h3>Impact Alert — ${impact.p_class || '—'} (${impact.severity})</h3>
-        <table>
-            <tr><td>Time (IST)</td><td>${getTimezoneTimestamp()}</td></tr>
-            <tr><td>Sensor</td><td>${impact.sensor}</td></tr>
-            <tr><td>Peak</td><td>${impact.peak_g.toFixed(3)} g</td></tr>
-            <tr><td>Class</td><td>${impact.p_class || '—'}</td></tr>
-            <tr><td>Distance</td><td>${(impact.distance_m/1000).toFixed(3)} km</td></tr>
-            <tr><td>GPS</td><td><a href="${mapsLink}">${mapsLink}</a></td></tr>
-            <tr><td>RMS V/L</td><td>${impact.rmsV?.toFixed(3)} / ${impact.rmsL?.toFixed(3)}</td></tr>
-            <tr><td>SD V/L</td><td>${impact.sdV?.toFixed(3)} / ${impact.sdL?.toFixed(3)}</td></tr>
-            <tr><td>Axes (X/Y/Z)</td><td>${impact.x?.toFixed(3)} / ${impact.y?.toFixed(3)} / ${impact.z?.toFixed(3)}</td></tr>
-        </table>`;
+    if (hasEmails) {
+        const html = `
+            <h3>Impact Alert — ${impact.p_class || '—'} (${impact.severity})</h3>
+            <table>
+                <tr><td>Time (IST)</td><td>${getTimezoneTimestamp()}</td></tr>
+                <tr><td>Sensor</td><td>${impact.sensor}</td></tr>
+                <tr><td>Peak</td><td>${impact.peak_g.toFixed(3)} g</td></tr>
+                <tr><td>Class</td><td>${impact.p_class || '—'}</td></tr>
+                <tr><td>Distance</td><td>${(impact.distance_m/1000).toFixed(3)} km</td></tr>
+                <tr><td>GPS</td><td><a href="${mapsLink}">${mapsLink}</a></td></tr>
+                <tr><td>RMS V/L</td><td>${impact.rmsV?.toFixed(3)} / ${impact.rmsL?.toFixed(3)}</td></tr>
+                <tr><td>SD V/L</td><td>${impact.sdV?.toFixed(3)} / ${impact.sdL?.toFixed(3)}</td></tr>
+                <tr><td>Axes (X/Y/Z)</td><td>${impact.x?.toFixed(3)} / ${impact.y?.toFixed(3)} / ${impact.z?.toFixed(3)}</td></tr>
+            </table>`;
 
-    try {
-        await transporter.sendMail({
-            from: process.env.SMTP_FROM,
-            to: notifyConfig.emails.join(','),
-            subject: `[IMPACT] ${impact.severity} Alert (${impact.p_class}) on ${impact.sensor}`,
-            html,
-        });
-        console.log(`[email] Alert sent for ${impact.sensor} ${impact.peak_g}g`);
-    } catch (e) {
-        console.error('[email] Send failed:', e.message);
+        try {
+            await transporter.sendMail({
+                from: process.env.SMTP_FROM,
+                to: notifyConfig.emails.join(','),
+                subject: `[IMPACT] ${impact.severity} Alert (${impact.p_class}) on ${impact.sensor}`,
+                html,
+            });
+            console.log(`[email] Alert sent for ${impact.sensor} ${impact.peak_g}g`);
+        } catch (e) {
+            console.error('[email] Send failed:', e.message);
+        }
+    }
+
+    // SMS rides the same trigger/cooldown as email but is independent of
+    // it — an SMS-gateway outage never blocks email, and vice versa.
+    if (hasPhones) {
+        smsGateway.sendImpactSms(notifyConfig.phones, impact, lastGpsCoord)
+            .catch(e => console.error('[sms] sendImpactSms error:', e.message));
     }
 }
 
@@ -588,6 +606,19 @@ async function initDB() {
                 timestamp        TIMESTAMPTZ NOT NULL,
                 lat REAL, lng REAL, speed_kmh REAL, total_distance_m REAL
             );
+            CREATE TABLE IF NOT EXISTS notification_config (
+                id           SERIAL PRIMARY KEY,
+                emails       TEXT[] NOT NULL DEFAULT '{}',
+                phones       TEXT[] NOT NULL DEFAULT '{}',
+                min_severity TEXT NOT NULL DEFAULT 'MEDIUM',
+                cooldown_sec INTEGER NOT NULL DEFAULT 60,
+                enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            ALTER TABLE notification_config ADD COLUMN IF NOT EXISTS phones TEXT[] NOT NULL DEFAULT '{}';
+            INSERT INTO notification_config (emails, phones, min_severity, cooldown_sec, enabled)
+                SELECT '{}', '{}', 'MEDIUM', 60, TRUE
+                WHERE NOT EXISTS (SELECT 1 FROM notification_config);
         `);
         await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_ae_timestamp   ON accelerometer_events(timestamp DESC);
@@ -849,15 +880,29 @@ app.get('/api/notify-emails', async (req, res) => {
 });
 
 app.post('/api/notify-emails', async (req, res) => {
-    const { emails, minSeverity, cooldownSec, enabled } = req.body;
+    const { emails, phones, minSeverity, cooldownSec, enabled } = req.body;
+    // Phones are written verbatim into the GSM board's text frames, so only
+    // accept plain numbers (optional +, 7-15 digits) — same rule as the UI.
+    if (phones !== undefined &&
+        (!Array.isArray(phones) || !phones.every(p => typeof p === 'string' && /^\+?[0-9]{7,15}$/.test(p)))) {
+        return res.status(400).json({ error: 'Invalid phone number(s): use digits only, optional leading +' });
+    }
     const newCfg = {
         emails: emails || [],
+        phones: phones || [],
         minSeverity: ['LOW', 'MEDIUM', 'HIGH'].includes(minSeverity) ? minSeverity : 'MEDIUM',
         cooldownSec: (typeof cooldownSec === 'number' && cooldownSec >= 0) ? cooldownSec : 60,
         enabled: enabled !== undefined ? enabled : true,
     };
     try {
         await saveNotifyEmails(newCfg);
+        // Push any newly entered phone number(s) to the GSM board right away.
+        const prevPhones = new Set(notifyConfig.phones || []);
+        const addedPhones = newCfg.phones.filter(p => !prevPhones.has(p));
+        if (addedPhones.length) {
+            smsGateway.sendPhoneNumbers(addedPhones)
+                .catch(e => console.error('[sms] sendPhoneNumbers error:', e.message));
+        }
         notifyConfig = newCfg;
         console.log('[notify] Config updated:', JSON.stringify(newCfg));
         io.emit('notify-config-changed', newCfg);
@@ -1426,6 +1471,47 @@ app.get('/api/management/system-health', async (req, res) => {
         res.json({ operational, warning, critical, total: operational + warning + critical });
     } catch (e) {
         console.error('/api/management/system-health error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Is the GSM/SMS trigger board currently connected, and did the last impact
+// trigger actually get written to it? See docs/sms-trigger-protocol.md.
+app.get('/api/sms-board/status', (req, res) => {
+    res.json(smsGateway.getStatus());
+});
+
+// Fires a synthetic impact through the exact same alert path a real one
+// uses (maybeSendImpactEmail → email + smsGateway.sendImpactSms), so this
+// is a genuine end-to-end test of the GSM board link — without needing any
+// accelerometer hardware connected. Honors the real configured severity
+// threshold, cooldown, and phone list exactly like production, and will
+// send a real SMS trigger to the board (and a real email) if those are
+// configured and enabled. Does NOT write anything to the database — purely
+// exercises the alert path, nothing else.
+app.post('/api/test/trigger-impact', async (req, res) => {
+    const body = req.body || {};
+    const impact = {
+        timestamp:   getTimezoneTimestamp(),
+        sensor:      ['left', 'right', 'pivot', 'aux'].includes(body.sensor) ? body.sensor : 'right',
+        severity:    ['LOW', 'MEDIUM', 'HIGH'].includes(body.severity) ? body.severity : 'HIGH',
+        p_class:     ['P1', 'P2', 'P3'].includes(body.p_class) ? body.p_class : 'P3',
+        peak_g:      typeof body.peak_g === 'number' ? body.peak_g : 8.5,
+        gForce:      typeof body.peak_g === 'number' ? body.peak_g : 8.5,
+        rmsV: 0.5, rmsL: 0.3, sdV: 0.1, sdL: 0.1, p2pV: 0.2, p2pL: 0.2,
+        x: 0, y: 0, z: 0,
+        distance_m:  typeof body.distance_m === 'number' ? body.distance_m : 1000,
+    };
+    console.log('[TEST] Synthetic impact triggered via /api/test/trigger-impact:', impact);
+    try {
+        await maybeSendImpactEmail(impact);
+        res.json({
+            success: true,
+            impact,
+            note: 'Sent through the real alert path (email + SMS). Check /api/sms-board/status and the server log for the outcome. Nothing was written to the database.',
+        });
+    } catch (e) {
+        console.error('[TEST] trigger-impact error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
@@ -2360,7 +2446,39 @@ function handleAccelSocket(socket, firstChunk) {
     socket.on('error', e  => console.log(`[ACCEL-TCP] ${sensorId} error: ${e.message}`));
 }
 
+// The GSM/SMS trigger board (see docs/sms-trigger-protocol.md) connects to
+// us as a TCP *client* — its firmware dials out to this server's own IP:PORT
+// and then just sits there waiting to receive, never sending anything of its
+// own. That means it can never be identified by sniffing a first byte like
+// the GPS/accel boards below; it's identified purely by source IP, and must
+// be routed off *before* the data-sniff/HTTP-fallback logic, since a
+// connection that never sends data would otherwise sit in that 30s timeout
+// and fall through to being treated (badly) as an idle HTTP connection.
+const SMS_BOARD_IP = process.env.SMS_BOARD_IP || '';
+
+function handleSmsBoardSocket(socket) {
+    const remoteIP = (socket.remoteAddress || '').replace('::ffff:', '');
+    console.log(`[SMS-BOARD] connected from ${remoteIP}`);
+    smsGateway.setBoardSocket(socket);
+    // Re-send the current numbers on (re)connect, so anything entered while
+    // the board was offline still reaches it.
+    smsGateway.sendPhoneNumbers(notifyConfig.phones || [])
+        .catch(e => console.error('[sms] sendPhoneNumbers error:', e.message));
+    socket.on('data', d => console.log(`[SMS-BOARD] unexpected ${d.length} bytes from board (ignored — board is receive-only)`));
+    socket.once('close', () => {
+        smsGateway.clearBoardSocket(socket);
+        console.log('[SMS-BOARD] disconnected');
+    });
+    socket.once('error', e => console.log(`[SMS-BOARD] socket error: ${e.message}`));
+}
+
 const tcpMux = net.createServer(rawSocket => {
+    const remoteIP = (rawSocket.remoteAddress || '').replace('::ffff:', '');
+    if (SMS_BOARD_IP && remoteIP === SMS_BOARD_IP) {
+        handleSmsBoardSocket(rawSocket);
+        return;
+    }
+
     let routed = false;
     const timeout = setTimeout(() => {
         if (routed) return;
