@@ -369,8 +369,32 @@ function setMqttBadge(state) {
     if (badge) { badge.textContent = state === 'live' ? 'LIVE' : 'OFFLINE'; badge.dataset.state = state; }
 }
 
+// ── GSM badge helpers ─────────────────────────────────────────────────────
+// status is the server's smsGateway.getStatus() payload, or null when we
+// can't reach the server and so don't know the board's state.
+function setGsmBadge(status) {
+    const text  = $('statusGsm');
+    const badge = $('statusGsmBadge');
+    const item  = $('statusGsmItem');
+    if (!status) {
+        if (text)  text.textContent = 'Unknown';
+        if (badge) { badge.textContent = '—'; badge.dataset.state = 'nofix'; }
+        if (item)  item.title = 'GSM/SMS alert board link — server unreachable';
+        return;
+    }
+    const up = !!status.connected;
+    if (text)  text.textContent = up ? 'Connected' : 'Not connected';
+    if (badge) { badge.textContent = up ? 'ONLINE' : 'OFFLINE'; badge.dataset.state = up ? 'online' : 'offline'; }
+    if (item) {
+        item.title = up
+            ? `GSM board connected since ${new Date(status.connectedAt).toLocaleString()}${status.remoteIP ? ` (${status.remoteIP})` : ''}`
+            : 'GSM board not connected — SMS impact alerts will not be sent';
+    }
+}
+
 // ── Socket.IO ────────────────────────────────────────────────────────────
 const socket = io(SERVER);
+socket.on('sms-board-status', setGsmBadge);
 socket.on('connect', () => {
     console.log('[operator] Socket connected');
     setText('liveText', 'LIVE');
@@ -383,6 +407,7 @@ socket.on('disconnect', () => {
     setText('liveText', 'NO SERVER');
     const dot = $('liveDot'); if (dot) dot.style.background = '#ef4444';
     setMqttBadge('offline');
+    setGsmBadge(null);
 });
 socket.on('connect_error', () => {
     setText('liveText', 'ERROR');

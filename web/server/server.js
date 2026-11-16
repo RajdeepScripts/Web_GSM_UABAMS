@@ -1852,6 +1852,9 @@ app.get('/api', (req, res) => {
 
 io.on('connection', async (socket) => {
     console.log('Client connected:', socket.id);
+    // Current GSM board state up front, so a freshly opened dashboard
+    // doesn't sit on "Unknown" until the next connect/disconnect.
+    socket.emit('sms-board-status', smsGateway.getStatus());
     try {
         const dbNow     = await getDBNow();
         const timeLimit = new Date(dbNow.getTime() - 86400000).toISOString();
@@ -2456,10 +2459,22 @@ function handleAccelSocket(socket, firstChunk) {
 // and fall through to being treated (badly) as an idle HTTP connection.
 const SMS_BOARD_IP = process.env.SMS_BOARD_IP || '';
 
+// Pushes the board's connected/not-connected state to every dashboard, so
+// the GSM badge flips the moment the link changes instead of on a poll.
+function broadcastSmsBoardStatus() {
+    io.emit('sms-board-status', smsGateway.getStatus());
+}
+
 function handleSmsBoardSocket(socket) {
     const remoteIP = (socket.remoteAddress || '').replace('::ffff:', '');
     console.log(`[SMS-BOARD] connected from ${remoteIP}`);
+    // The board never sends anything, so a board that loses power or its
+    // network would otherwise leave this socket looking open forever.
+    // Keepalive probes make the kernel eventually close it, which fires
+    // 'close' below and flips the dashboard badge to not-connected.
+    socket.setKeepAlive(true, 10000);
     smsGateway.setBoardSocket(socket);
+    broadcastSmsBoardStatus();
     // Re-send the current numbers on (re)connect, so anything entered while
     // the board was offline still reaches it.
     smsGateway.sendPhoneNumbers(notifyConfig.phones || [])
@@ -2468,6 +2483,7 @@ function handleSmsBoardSocket(socket) {
     socket.once('close', () => {
         smsGateway.clearBoardSocket(socket);
         console.log('[SMS-BOARD] disconnected');
+        broadcastSmsBoardStatus();
     });
     socket.once('error', e => console.log(`[SMS-BOARD] socket error: ${e.message}`));
 }
