@@ -1247,7 +1247,7 @@ app.get('/api/historical/graph/:hours', async (req, res) => {
             if (idx !== -1) buckets[sec][`accel${idx + 1}`] = doc.x_axis || 0;
         });
 
-        res.json(Object.values(buckets).sort((a, b) => a.timestamp.localeCompare(b.timestamp)));
+        res.json(Object.values(buckets).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)));
     } catch (e) {
         console.error('/api/historical/graph error:', e);
         res.status(500).json({ error: e.message });
